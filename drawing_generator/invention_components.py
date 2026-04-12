@@ -5,16 +5,19 @@ node ids come from that registry; visible labels are `<canonical>-<id>` (canonic
 
 LLM wording lives in PROMPT_* and USER_* constants near the top of this file.
 A verify node refines the graph; a final node converts JSON to draw.io XML and builds a diagrams.net URL.
+CLI --diagram-style selects the terminal LangGraph node: drawio_block (LLM layout) vs drawio_flowchart (code pipeline).
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
 import urllib.parse
+from collections import deque
 from typing import Literal, TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -442,6 +445,9 @@ class InventionState(TypedDict):
 LLMProvider = Literal["openai", "claude"]
 _LLM_PROVIDER: LLMProvider = "openai"
 
+# block: component-style boxes at LLM x/y; flowchart: deterministic top-down pipeline XML
+DiagramStyle = Literal["block", "flowchart"]
+
 
 def set_llm_provider(provider: LLMProvider) -> None:
     global _LLM_PROVIDER
@@ -491,6 +497,138 @@ _MINIMAL_MXGRAPH = (
     "</root></mxGraphModel>"
 )
 
+# Flowchart layout (deterministic): top-down vertical pipeline, distinct from LLM block layout.
+_FC_MARGIN = 96.0
+_FC_NODE_W = 140.0
+_FC_NODE_H = 64.0
+_FC_GAP_Y = 56.0
+_FC_VERTEX_STYLE = (
+    "rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;"
+    "strokeWidth=2;fontSize=12;fontStyle=0;fillColor=#E3F2FD;strokeColor=#1565C0;"
+)
+_FC_EDGE_STYLE = (
+    "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;"
+    "endArrow=blockThin;endFill=1;strokeWidth=2;fontSize=12;"
+)
+
+
+def _normalize_node_id(nid: object) -> int | str:
+    if isinstance(nid, float) and nid == int(nid):
+        return int(nid)
+    if isinstance(nid, int) and type(nid) is not bool:
+        return nid
+    return nid
+
+
+def _flowchart_node_order(nodes: list[dict], edges: list[dict]) -> list[int | str]:
+    """Topological order for pipeline layout; ties broken by id. Appends any leftover nodes."""
+    id_list: list[int | str] = []
+    for n in nodes:
+        if not isinstance(n, dict) or "id" not in n:
+            continue
+        id_list.append(_normalize_node_id(n["id"]))
+    id_set = set(id_list)
+    in_deg: dict[int | str, int] = {i: 0 for i in id_list}
+    out_adj: dict[int | str, list[int | str]] = {i: [] for i in id_list}
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        s = _normalize_node_id(e.get("source"))
+        t = _normalize_node_id(e.get("target"))
+        if s not in id_set or t not in id_set or s == t:
+            continue
+        out_adj[s].append(t)
+        in_deg[t] += 1
+    for v in out_adj:
+        out_adj[v].sort(key=lambda x: (str(type(x)), str(x)))
+
+    q = deque(sorted([i for i in id_list if in_deg[i] == 0], key=lambda x: (str(type(x)), str(x))))
+    order: list[int | str] = []
+    while q:
+        u = q.popleft()
+        order.append(u)
+        for v in out_adj[u]:
+            in_deg[v] -= 1
+            if in_deg[v] == 0:
+                q.append(v)
+    seen = set(order)
+    for i in sorted(id_list, key=lambda x: (str(type(x)), str(x))):
+        if i not in seen:
+            order.append(i)
+    return order
+
+
+def _render_flowchart_mxgraph_xml(graph: dict) -> str:
+    """Build draw.io XML with a top-down flowchart layout (no LLM). Visually distinct from block mode."""
+    nodes = graph.get("nodes") or []
+    edges = graph.get("edges") or []
+    if not nodes:
+        return _MINIMAL_MXGRAPH
+
+    label_by_id: dict[int | str, str] = {}
+    for n in nodes:
+        if not isinstance(n, dict) or "id" not in n:
+            continue
+        nid = _normalize_node_id(n["id"])
+        label_by_id[nid] = str(n.get("label", ""))
+
+    order = _flowchart_node_order([n for n in nodes if isinstance(n, dict)], edges)
+    x = _FC_MARGIN
+    pos_y: dict[int | str, float] = {}
+    for i, nid in enumerate(order):
+        pos_y[nid] = _FC_MARGIN + float(i) * (_FC_NODE_H + _FC_GAP_Y)
+
+    n_boxes = len(order)
+    content_h = (
+        float(max(0, n_boxes - 1)) * (_FC_NODE_H + _FC_GAP_Y) + _FC_NODE_H if n_boxes else 0.0
+    )
+    max_y = _FC_MARGIN + content_h + _FC_MARGIN
+    page_w_in = max(8.5, (_FC_MARGIN * 2.0 + _FC_NODE_W) / 96.0)
+    page_h_in = max(11.0, max_y / 96.0)
+
+    parts: list[str] = [
+        f'<mxGraphModel dx="0" dy="0" grid="1" gridSize="10" page="1" pageScale="1" '
+        f'pageWidth="{page_w_in:.2f}" pageHeight="{page_h_in:.2f}">',
+        "<root>",
+        '<mxCell id="0"/>',
+        '<mxCell id="1" parent="0"/>',
+    ]
+
+    for nid in order:
+        cid = f"n{nid}"
+        lab = html.escape(label_by_id.get(nid, ""), quote=True)
+        y = pos_y[nid]
+        parts.append(
+            f'<mxCell id="{cid}" value="{lab}" style="{_FC_VERTEX_STYLE}" '
+            f'vertex="1" parent="1">'
+            f'<mxGeometry x="{x:.1f}" y="{y:.1f}" width="{_FC_NODE_W}" height="{_FC_NODE_H}" as="geometry"/>'
+            f"</mxCell>"
+        )
+
+    ei = 0
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        s = _normalize_node_id(e.get("source"))
+        t = _normalize_node_id(e.get("target"))
+        if s not in label_by_id or t not in label_by_id or s == t:
+            continue
+        elabel = e.get("label")
+        val_attr = ""
+        if elabel is not None and str(elabel).strip():
+            val_attr = f' value="{html.escape(str(elabel), quote=True)}"'
+        eid = f"e{ei}"
+        ei += 1
+        parts.append(
+            f'<mxCell id="{eid}"{val_attr} style="{_FC_EDGE_STYLE}" edge="1" parent="1" '
+            f'source="n{s}" target="n{t}">'
+            '<mxGeometry relative="1" as="geometry"/>'
+            "</mxCell>"
+        )
+
+    parts.append("</root></mxGraphModel>")
+    return "".join(parts)
+
 
 def _extract_mx_graph_model_xml(text: str) -> str:
     """Strip fences and return the mxGraphModel element from model output."""
@@ -499,10 +637,31 @@ def _extract_mx_graph_model_xml(text: str) -> str:
         raw = re.sub(r"^```[a-zA-Z0-9]*\s*\n", "", raw)
         raw = re.sub(r"\n```\s*$", "", raw)
         raw = raw.strip()
-    m = re.search(r"<mxGraphModel\b[^>]*>[\s\S]*</mxGraphModel>", raw, re.IGNORECASE)
+    m = re.search(
+        r"<mxGraphModel\b[^>]*>[\s\S]*?</mxGraphModel>",
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
     if m:
         return m.group(0).strip()
     return raw
+
+
+def _verified_graph_to_drawio_block_xml(graph: dict) -> str:
+    """LLM-generated block diagram: uses JSON node x/y from the layout step."""
+    if not graph.get("nodes"):
+        return _MINIMAL_MXGRAPH
+    llm = _require_llm()
+    system_msg = SystemMessage(content=PROMPT_JSON_TO_DRAWIO_XML)
+    human_msg = HumanMessage(
+        content=USER_JSON_TO_DRAWIO.format(graph_json=json.dumps(graph, indent=2))
+    )
+    out = llm.invoke([system_msg, human_msg])
+    text = out.content if isinstance(out.content, str) else str(out.content)
+    xml_content = _extract_mx_graph_model_xml(text)
+    if not re.search(r"<mxGraphModel\b", xml_content, re.IGNORECASE):
+        return _MINIMAL_MXGRAPH
+    return xml_content
 
 
 def diagrams_net_create_url(xml_content: str) -> str:
@@ -620,38 +779,44 @@ def node_verify_component_graph(state: InventionState) -> dict[str, dict]:
     return {"component_graph": final_graph}
 
 
-def node_graph_to_drawio_xml(state: InventionState) -> dict[str, str]:
-    """Convert verified component_graph JSON to draw.io mxGraphModel XML via LLM."""
+def node_drawio_block(state: InventionState) -> dict[str, str]:
+    """Block diagram via LLM (layout x/y from graph JSON)."""
     graph = state["component_graph"]
     if not isinstance(graph, dict) or not graph.get("nodes"):
         return {"drawio_xml": _MINIMAL_MXGRAPH}
+    return {"drawio_xml": _verified_graph_to_drawio_block_xml(graph)}
 
-    llm = _require_llm()
-    system_msg = SystemMessage(content=PROMPT_JSON_TO_DRAWIO_XML)
-    human_msg = HumanMessage(
-        content=USER_JSON_TO_DRAWIO.format(graph_json=json.dumps(graph, indent=2))
-    )
-    out = llm.invoke([system_msg, human_msg])
-    text = out.content if isinstance(out.content, str) else str(out.content)
-    xml_content = _extract_mx_graph_model_xml(text)
-    if "<mxGraphModel" not in xml_content:
+
+def node_drawio_flowchart(state: InventionState) -> dict[str, str]:
+    """Flowchart via deterministic top-down pipeline (rounded boxes, arrows)."""
+    graph = state["component_graph"]
+    if not isinstance(graph, dict) or not graph.get("nodes"):
         return {"drawio_xml": _MINIMAL_MXGRAPH}
-    return {"drawio_xml": xml_content}
+    return {"drawio_xml": _render_flowchart_mxgraph_xml(graph)}
 
 
-def build_graph():
+def build_graph(diagram_style: DiagramStyle = "block"):
+    """Build pipeline: shared nodes through verify, then exactly one draw.io terminal node."""
     g = StateGraph(InventionState)
     g.add_node("description_generation", node_description_generation)
     g.add_node("component_extraction", node_component_extraction)
     g.add_node("component_graph_json", node_component_graph_json)
     g.add_node("verify_component_graph", node_verify_component_graph)
-    g.add_node("graph_to_drawio_xml", node_graph_to_drawio_xml)
+
     g.add_edge(START, "description_generation")
     g.add_edge("description_generation", "component_extraction")
     g.add_edge("component_extraction", "component_graph_json")
     g.add_edge("component_graph_json", "verify_component_graph")
-    g.add_edge("verify_component_graph", "graph_to_drawio_xml")
-    g.add_edge("graph_to_drawio_xml", END)
+
+    if diagram_style == "flowchart":
+        g.add_node("drawio_flowchart", node_drawio_flowchart)
+        g.add_edge("verify_component_graph", "drawio_flowchart")
+        g.add_edge("drawio_flowchart", END)
+    else:
+        g.add_node("drawio_block", node_drawio_block)
+        g.add_edge("verify_component_graph", "drawio_block")
+        g.add_edge("drawio_block", END)
+
     return g.compile()
 
 
@@ -664,6 +829,13 @@ def main() -> None:
         default="openai",
         help="LLM backend: openai (OPENAI_API_KEY; optional OPENAI_MODEL) or "
         "claude (ANTHROPIC_API_KEY or CLAUDE_API_KEY; optional CLAUDE_MODEL)",
+    )
+    parser.add_argument(
+        "--diagram-style",
+        choices=("block", "flowchart"),
+        default="block",
+        help="Terminal graph node: block=drawio_block (LLM, JSON x/y); "
+        "flowchart=drawio_flowchart (deterministic top-down pipeline).",
     )
     args = parser.parse_args()
 
@@ -683,7 +855,7 @@ def main() -> None:
         "drawio_xml": "",
     }
 
-    graph = build_graph()
+    graph = build_graph(diagram_style=args.diagram_style)
     final = graph.invoke(initial)
 
     print("\n--- Generated description ---\n")

@@ -1,5 +1,5 @@
 {
-  "invention_name": "Edge AI Thermostat",
-  "description": "A wall-mounted device that learns occupancy patterns and adjusts HVAC.",
-  "key_innovation": "On-device neural network for inference; uses a low-power CPU with an integrated GPU for model runs; wireless connectivity via Wi-Fi and Bluetooth; temperature sensing with MEMS sensors.The central processing unit is important"
+  "invention_name": "Neural network image analyzer",
+  "description": "Systems and methods including one or more processing modules and one or more non-transitory storage modules storing computing instructions configured to run on the one or more processing modules and perform acts of: receiving an image at a first-level analysis component comprising a first neural network structure; analyzing, using the first neural network structure of the first-level analysis component, the image to determine an image category associated with the image; selecting at least one second-level analysis component that is associated with the image category to analyze the image; analyzing, using a second neural network structure associated with the at least one second-level analysis component that was selected, the image to determine whether the image includes non-compliant content; and in response to determining that the image includes non-compliant content, executing a corrective measure. Other embodiments are disclosed herein.",
+"key_innovation":""
 }
