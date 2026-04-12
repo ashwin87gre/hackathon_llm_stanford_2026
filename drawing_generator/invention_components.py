@@ -1,11 +1,10 @@
 """
 Read invention JSON, generate a rich description with an LLM, extract canonical
 components via register_component (canonical -> int id), then emit a JSON graph whose
-node ids come from that registry; visible labels are `<canonical>-<id>` (canonical from LLM, id from code); the LLM supplies x/y and edges.
+node ids come from that registry; visible labels are `<canonical>-<id>` (canonical from LLM, id from code); layout LLM proposes connectivity; draw.io positions are computed in code (no overlap).
 
 LLM wording lives in PROMPT_* and USER_* constants near the top of this file.
-A verify node refines the graph; a final node converts JSON to draw.io XML and builds a diagrams.net URL.
-CLI --diagram-style selects the terminal LangGraph node: drawio_block (LLM layout) vs drawio_flowchart (code pipeline).
+A verify node refines the graph; draw.io XML uses deterministic positions; a final LLM node writes the Brief Description of the Drawings; output includes that text and the diagrams.net URL.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import os
 import re
 import sys
 import urllib.parse
-from collections import deque
+from collections import defaultdict, deque
 from typing import Literal, TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -223,30 +222,26 @@ Draft component graph JSON:
 """
 
 
-PROMPT_JSON_TO_DRAWIO_XML = """\
-You convert a component graph JSON into a single draw.io (diagrams.net) diagram in XML format.
+PROMPT_BRIEF_DESCRIPTION_DRAWINGS_SYSTEM = """\
+You are a patent drafting assistant.
 
-Output ONLY the raw XML for one root element: <mxGraphModel>...</mxGraphModel>. No markdown, no commentary, no code fences.
+Your task is to write the **Brief Description of the Drawings** section of a patent application from the provided JSON.
 
-Patent-figure compliance (mandatory):
-- Margins: Lay out the diagram so there is at least a 1 inch margin on all sides between the page/drawing bounds and any figure content (boxes, lines, labels). Use a sufficiently large logical page in the model (e.g. set pageWidth/pageHeight on <mxGraphModel> or equivalent draw.io attributes in inches or points as supported) and offset all shapes so nothing sits inside that 1 inch inset from each edge. At 96 dpi, 1 inch ≈ 96 px—ensure positions respect that minimum clearance from the diagram boundary you define.
-- Typography: Every visible text (vertex labels, edge labels, and any annotations) must use a minimum font size of 12 pt. Encode this in each cell’s style string (e.g.fontSize=12; or fontSize=12 as required by draw.io), and do not use smaller fonts anywhere.
-
-Structure requirements:
-- The root must be <mxGraphModel> with a child <root>.
-- Include <mxCell id="0"/> and <mxCell id="1" parent="0"/> as standard (layer 0 and default parent).
-- For each node in the JSON, add an <mxCell> with vertex="1", parent="1", a unique id (e.g. n{id}), value=the node label, and <mxGeometry> using the JSON x, y with reasonable width/height (e.g. 120x60), adjusted as needed to satisfy the 1 inch margin rule relative to the page.
-- For each edge, add <mxCell> with edge="1", parent="1", source and target pointing to the corresponding vertex cell ids, optional value=edge label if present; edge label styles must also use fontSize at least 12.
-- Use orthogonal or simple connector style in the edge style string.
-
-Escape special characters in XML attribute values properly (&amp; &lt; &gt; &quot;).
-
-If the JSON is empty, still output a minimal valid <mxGraphModel> with only the default cells (margins and font rules still apply if any text appears)."""
+Instructions:
+- Use formal US patent style.
+- Write a section titled exactly: **Brief Description of the Drawings**
+- For each figure in the JSON, write one concise sentence beginning with "FIG. X".
+- Describe what the figure illustrates in clear, neutral, technical language.
+- Do not add interpretation, advantages, claim language, marketing language, or implementation details beyond what is needed to identify the figure.
+- Do not invent figures or technical details not supported by the JSON.
+- Keep the output concise and professional.
+- Output only the final section text."""
 
 
-USER_JSON_TO_DRAWIO = """\
-Convert this verified component graph JSON to draw.io XML (mxGraphModel only):
+USER_BRIEF_DESCRIPTION_DRAWINGS = """\
+Invention name: {invention_name}
 
+Component diagram JSON (the drawing content to describe):
 {graph_json}
 """
 
@@ -254,6 +249,13 @@ Convert this verified component graph JSON to draw.io XML (mxGraphModel only):
 # Shared registry: canonical_name -> unique integer id (assigned on first registration)
 _COMPONENT_ID_MAP: dict[str, int] = {}
 _NEXT_COMPONENT_ID: int = 0
+
+
+def reset_component_registry() -> None:
+    """Clear register_component state before a new pipeline run."""
+    global _NEXT_COMPONENT_ID
+    _COMPONENT_ID_MAP.clear()
+    _NEXT_COMPONENT_ID = 0
 
 
 def _new_component_id() -> int:
@@ -440,14 +442,11 @@ class InventionState(TypedDict):
     generated_description: str
     component_graph: dict
     drawio_xml: str
+    brief_description_drawings: str
 
 
 LLMProvider = Literal["openai", "claude"]
 _LLM_PROVIDER: LLMProvider = "openai"
-
-# block: component-style boxes at LLM x/y; flowchart: deterministic top-down pipeline XML
-DiagramStyle = Literal["block", "flowchart"]
-
 
 def set_llm_provider(provider: LLMProvider) -> None:
     global _LLM_PROVIDER
@@ -485,6 +484,22 @@ def load_invention(path: str) -> dict:
     return data
 
 
+def invoke_patent_drawing_pipeline(data: dict) -> InventionState:
+    """Run the full LangGraph once. `data` must include invention_name, description, key_innovation."""
+    reset_component_registry()
+    initial: InventionState = {
+        "invention_name": data["invention_name"],
+        "description": data["description"],
+        "key_innovation": data["key_innovation"],
+        "generated_description": "",
+        "component_graph": {},
+        "drawio_xml": "",
+        "brief_description_drawings": "",
+    }
+    graph = build_graph()
+    return graph.invoke(initial)
+
+
 def _component_registry_json_for_prompt() -> str:
     """Pretty-print current register_component map for injection into LLM messages."""
     if not _COMPONENT_ID_MAP:
@@ -497,22 +512,34 @@ _MINIMAL_MXGRAPH = (
     "</root></mxGraphModel>"
 )
 
-# Flowchart layout (deterministic): top-down vertical pipeline, distinct from LLM block layout.
-_FC_MARGIN = 96.0
-_FC_NODE_W = 140.0
-_FC_NODE_H = 64.0
-_FC_GAP_Y = 56.0
-_FC_VERTEX_STYLE = (
-    "rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;"
-    "strokeWidth=2;fontSize=12;fontStyle=0;fillColor=#E3F2FD;strokeColor=#1565C0;"
+# Block diagram layout (deterministic): layered columns left→right, stacked vertically per layer.
+_BLK_MARGIN = 96.0
+_BLK_NODE_W = 220.0
+_BLK_NODE_H_MIN = 56.0
+_BLK_GAP_X = 96.0
+_BLK_GAP_Y = 80.0
+_BLK_LINE_HEIGHT_PX = 20.0
+_BLK_PAD_Y = 18.0
+_BLK_PAD_X = 18.0
+_BLK_AVG_CHAR_PX = 7.0
+_BLK_EDGE_LABEL_MAX = 42
+_BLK_VERTEX_STYLE = (
+    "rounded=0;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;"
+    "strokeWidth=2;fontSize=12;fontStyle=0;fillColor=#FFFFFF;strokeColor=#333333;"
 )
-_FC_EDGE_STYLE = (
+_BLK_EDGE_BASE = (
     "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;"
-    "endArrow=blockThin;endFill=1;strokeWidth=2;fontSize=12;"
+    "endArrow=classic;endFill=1;strokeWidth=2;"
 )
+_BLK_EDGE_LABELED = (
+    _BLK_EDGE_BASE
+    + "fontSize=12;fontStyle=0;labelBackgroundColor=#FFFFFF;labelBorderColor=#B0BEC5;"
+    "spacingTop=2;spacingBottom=2;spacingLeft=4;spacingRight=4;"
+)
+_BLK_EDGE_UNLABELED = _BLK_EDGE_BASE + "fontSize=12;"
 
 
-def _normalize_node_id(nid: object) -> int | str:
+def _blk_normalize_id(nid: object) -> int | str:
     if isinstance(nid, float) and nid == int(nid):
         return int(nid)
     if isinstance(nid, int) and type(nid) is not bool:
@@ -520,29 +547,40 @@ def _normalize_node_id(nid: object) -> int | str:
     return nid
 
 
-def _flowchart_node_order(nodes: list[dict], edges: list[dict]) -> list[int | str]:
-    """Topological order for pipeline layout; ties broken by id. Appends any leftover nodes."""
-    id_list: list[int | str] = []
-    for n in nodes:
-        if not isinstance(n, dict) or "id" not in n:
-            continue
-        id_list.append(_normalize_node_id(n["id"]))
-    id_set = set(id_list)
-    in_deg: dict[int | str, int] = {i: 0 for i in id_list}
-    out_adj: dict[int | str, list[int | str]] = {i: [] for i in id_list}
+def _blk_truncated_edge_label(raw: object) -> str | None:
+    s = str(raw).strip() if raw is not None else ""
+    if not s:
+        return None
+    if len(s) > _BLK_EDGE_LABEL_MAX:
+        s = s[: _BLK_EDGE_LABEL_MAX - 3].rstrip() + "..."
+    return s
+
+
+def _blk_box_dimensions(label: str) -> tuple[float, float]:
+    w = _BLK_NODE_W
+    inner = max(8.0, w - 2.0 * _BLK_PAD_X)
+    cpl = max(12, int(inner / _BLK_AVG_CHAR_PX))
+    n = len(label) if label else 0
+    n_lines = max(1, (n + cpl - 1) // cpl)
+    h = max(_BLK_NODE_H_MIN, float(n_lines) * _BLK_LINE_HEIGHT_PX + 2.0 * _BLK_PAD_Y)
+    return (w, h)
+
+
+def _blk_topological_order(ids: set[int | str], edges: list[dict]) -> list[int | str]:
+    out_adj: dict[int | str, list[int | str]] = defaultdict(list)
+    in_deg: dict[int | str, int] = {i: 0 for i in ids}
     for e in edges:
         if not isinstance(e, dict):
             continue
-        s = _normalize_node_id(e.get("source"))
-        t = _normalize_node_id(e.get("target"))
-        if s not in id_set or t not in id_set or s == t:
+        s = _blk_normalize_id(e.get("source"))
+        t = _blk_normalize_id(e.get("target"))
+        if s not in ids or t not in ids or s == t:
             continue
         out_adj[s].append(t)
         in_deg[t] += 1
     for v in out_adj:
         out_adj[v].sort(key=lambda x: (str(type(x)), str(x)))
-
-    q = deque(sorted([i for i in id_list if in_deg[i] == 0], key=lambda x: (str(type(x)), str(x))))
+    q = deque(sorted([i for i in ids if in_deg[i] == 0], key=lambda x: (str(type(x)), str(x))))
     order: list[int | str] = []
     while q:
         u = q.popleft()
@@ -552,14 +590,32 @@ def _flowchart_node_order(nodes: list[dict], edges: list[dict]) -> list[int | st
             if in_deg[v] == 0:
                 q.append(v)
     seen = set(order)
-    for i in sorted(id_list, key=lambda x: (str(type(x)), str(x))):
+    for i in sorted(ids, key=lambda x: (str(type(x)), str(x))):
         if i not in seen:
             order.append(i)
     return order
 
 
-def _render_flowchart_mxgraph_xml(graph: dict) -> str:
-    """Build draw.io XML with a top-down flowchart layout (no LLM). Visually distinct from block mode."""
+def _blk_compute_levels(ids: set[int | str], edges: list[dict], topo: list[int | str]) -> dict[int | str, int]:
+    """DAG layer index along primary flow (left = earlier in pipeline). Cycles: best-effort."""
+    out_adj: dict[int | str, list[int | str]] = defaultdict(list)
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        s = _blk_normalize_id(e.get("source"))
+        t = _blk_normalize_id(e.get("target"))
+        if s not in ids or t not in ids or s == t:
+            continue
+        out_adj[s].append(t)
+    level: dict[int | str, int] = {i: 0 for i in ids}
+    for u in topo:
+        for v in out_adj.get(u, []):
+            level[v] = max(level[v], level[u] + 1)
+    return level
+
+
+def _render_block_diagram_mxgraph_xml(graph: dict) -> str:
+    """draw.io block diagram: orthogonal edges, positions from layered layout (no LLM)."""
     nodes = graph.get("nodes") or []
     edges = graph.get("edges") or []
     if not nodes:
@@ -569,22 +625,37 @@ def _render_flowchart_mxgraph_xml(graph: dict) -> str:
     for n in nodes:
         if not isinstance(n, dict) or "id" not in n:
             continue
-        nid = _normalize_node_id(n["id"])
+        nid = _blk_normalize_id(n["id"])
         label_by_id[nid] = str(n.get("label", ""))
 
-    order = _flowchart_node_order([n for n in nodes if isinstance(n, dict)], edges)
-    x = _FC_MARGIN
-    pos_y: dict[int | str, float] = {}
-    for i, nid in enumerate(order):
-        pos_y[nid] = _FC_MARGIN + float(i) * (_FC_NODE_H + _FC_GAP_Y)
+    ids: set[int | str] = set(label_by_id.keys())
+    edge_rows = [e for e in edges if isinstance(e, dict)]
+    topo = _blk_topological_order(ids, edge_rows)
+    level_of = _blk_compute_levels(ids, edge_rows, topo)
 
-    n_boxes = len(order)
-    content_h = (
-        float(max(0, n_boxes - 1)) * (_FC_NODE_H + _FC_GAP_Y) + _FC_NODE_H if n_boxes else 0.0
-    )
-    max_y = _FC_MARGIN + content_h + _FC_MARGIN
-    page_w_in = max(8.5, (_FC_MARGIN * 2.0 + _FC_NODE_W) / 96.0)
-    page_h_in = max(11.0, max_y / 96.0)
+    by_level: dict[int, list[int | str]] = defaultdict(list)
+    for nid in ids:
+        by_level[level_of[nid]].append(nid)
+    for lv in by_level:
+        by_level[lv].sort(key=lambda x: (str(type(x)), str(x)))
+
+    col_w = _BLK_NODE_W + _BLK_GAP_X
+    pos: dict[int | str, tuple[float, float, float, float]] = {}
+    max_x = _BLK_MARGIN
+    max_y = _BLK_MARGIN
+
+    for lv in sorted(by_level.keys()):
+        x = _BLK_MARGIN + float(lv) * col_w
+        y_cur = _BLK_MARGIN
+        for nid in by_level[lv]:
+            bw, bh = _blk_box_dimensions(label_by_id.get(nid, ""))
+            pos[nid] = (x, y_cur, bw, bh)
+            max_x = max(max_x, x + bw)
+            max_y = max(max_y, y_cur + bh)
+            y_cur += bh + _BLK_GAP_Y
+
+    page_w_in = max(11.0, (max_x + _BLK_MARGIN) / 96.0)
+    page_h_in = max(8.5, (max_y + _BLK_MARGIN) / 96.0)
 
     parts: list[str] = [
         f'<mxGraphModel dx="0" dy="0" grid="1" gridSize="10" page="1" pageScale="1" '
@@ -594,33 +665,33 @@ def _render_flowchart_mxgraph_xml(graph: dict) -> str:
         '<mxCell id="1" parent="0"/>',
     ]
 
-    for nid in order:
+    for nid in sorted(ids, key=lambda x: (str(type(x)), str(x))):
         cid = f"n{nid}"
         lab = html.escape(label_by_id.get(nid, ""), quote=True)
-        y = pos_y[nid]
+        x, y, bw, bh = pos[nid]
         parts.append(
-            f'<mxCell id="{cid}" value="{lab}" style="{_FC_VERTEX_STYLE}" '
+            f'<mxCell id="{cid}" value="{lab}" style="{_BLK_VERTEX_STYLE}" '
             f'vertex="1" parent="1">'
-            f'<mxGeometry x="{x:.1f}" y="{y:.1f}" width="{_FC_NODE_W}" height="{_FC_NODE_H}" as="geometry"/>'
+            f'<mxGeometry x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{bh:.1f}" as="geometry"/>'
             f"</mxCell>"
         )
 
     ei = 0
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
-        s = _normalize_node_id(e.get("source"))
-        t = _normalize_node_id(e.get("target"))
+    for e in edge_rows:
+        s = _blk_normalize_id(e.get("source"))
+        t = _blk_normalize_id(e.get("target"))
         if s not in label_by_id or t not in label_by_id or s == t:
             continue
-        elabel = e.get("label")
+        short = _blk_truncated_edge_label(e.get("label"))
         val_attr = ""
-        if elabel is not None and str(elabel).strip():
-            val_attr = f' value="{html.escape(str(elabel), quote=True)}"'
+        estyle = _BLK_EDGE_UNLABELED
+        if short is not None:
+            val_attr = f' value="{html.escape(short, quote=True)}"'
+            estyle = _BLK_EDGE_LABELED
         eid = f"e{ei}"
         ei += 1
         parts.append(
-            f'<mxCell id="{eid}"{val_attr} style="{_FC_EDGE_STYLE}" edge="1" parent="1" '
+            f'<mxCell id="{eid}"{val_attr} style="{estyle}" edge="1" parent="1" '
             f'source="n{s}" target="n{t}">'
             '<mxGeometry relative="1" as="geometry"/>'
             "</mxCell>"
@@ -630,38 +701,11 @@ def _render_flowchart_mxgraph_xml(graph: dict) -> str:
     return "".join(parts)
 
 
-def _extract_mx_graph_model_xml(text: str) -> str:
-    """Strip fences and return the mxGraphModel element from model output."""
-    raw = text.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z0-9]*\s*\n", "", raw)
-        raw = re.sub(r"\n```\s*$", "", raw)
-        raw = raw.strip()
-    m = re.search(
-        r"<mxGraphModel\b[^>]*>[\s\S]*?</mxGraphModel>",
-        raw,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        return m.group(0).strip()
-    return raw
-
-
 def _verified_graph_to_drawio_block_xml(graph: dict) -> str:
-    """LLM-generated block diagram: uses JSON node x/y from the layout step."""
+    """Emit block diagram XML with code-computed positions (ignores JSON x/y)."""
     if not graph.get("nodes"):
         return _MINIMAL_MXGRAPH
-    llm = _require_llm()
-    system_msg = SystemMessage(content=PROMPT_JSON_TO_DRAWIO_XML)
-    human_msg = HumanMessage(
-        content=USER_JSON_TO_DRAWIO.format(graph_json=json.dumps(graph, indent=2))
-    )
-    out = llm.invoke([system_msg, human_msg])
-    text = out.content if isinstance(out.content, str) else str(out.content)
-    xml_content = _extract_mx_graph_model_xml(text)
-    if not re.search(r"<mxGraphModel\b", xml_content, re.IGNORECASE):
-        return _MINIMAL_MXGRAPH
-    return xml_content
+    return _render_block_diagram_mxgraph_xml(graph)
 
 
 def diagrams_net_create_url(xml_content: str) -> str:
@@ -780,42 +824,54 @@ def node_verify_component_graph(state: InventionState) -> dict[str, dict]:
 
 
 def node_drawio_block(state: InventionState) -> dict[str, str]:
-    """Block diagram via LLM (layout x/y from graph JSON)."""
+    """Block diagram: draw.io XML with deterministic layered layout (no diagram LLM)."""
     graph = state["component_graph"]
     if not isinstance(graph, dict) or not graph.get("nodes"):
         return {"drawio_xml": _MINIMAL_MXGRAPH}
     return {"drawio_xml": _verified_graph_to_drawio_block_xml(graph)}
 
 
-def node_drawio_flowchart(state: InventionState) -> dict[str, str]:
-    """Flowchart via deterministic top-down pipeline (rounded boxes, arrows)."""
+def node_brief_description_drawings(state: InventionState) -> dict[str, str]:
+    """LLM: Brief Description of the Drawings from verified component graph JSON."""
     graph = state["component_graph"]
     if not isinstance(graph, dict) or not graph.get("nodes"):
-        return {"drawio_xml": _MINIMAL_MXGRAPH}
-    return {"drawio_xml": _render_flowchart_mxgraph_xml(graph)}
+        return {
+            "brief_description_drawings": (
+                "Brief Description of the Drawings\n\n"
+                "No component diagram was generated; there are no figures to describe."
+            )
+        }
+
+    llm = _require_llm()
+    system_msg = SystemMessage(content=PROMPT_BRIEF_DESCRIPTION_DRAWINGS_SYSTEM)
+    human_msg = HumanMessage(
+        content=USER_BRIEF_DESCRIPTION_DRAWINGS.format(
+            invention_name=state["invention_name"],
+            graph_json=json.dumps(graph, indent=2),
+        )
+    )
+    out = llm.invoke([system_msg, human_msg])
+    text = out.content if isinstance(out.content, str) else str(out.content)
+    return {"brief_description_drawings": text.strip()}
 
 
-def build_graph(diagram_style: DiagramStyle = "block"):
-    """Build pipeline: shared nodes through verify, then exactly one draw.io terminal node."""
+def build_graph():
+    """Pipeline through description, components, graph, verify, draw.io export, then brief description of drawings."""
     g = StateGraph(InventionState)
     g.add_node("description_generation", node_description_generation)
     g.add_node("component_extraction", node_component_extraction)
     g.add_node("component_graph_json", node_component_graph_json)
     g.add_node("verify_component_graph", node_verify_component_graph)
+    g.add_node("drawio_block", node_drawio_block)
+    g.add_node("brief_description_drawings", node_brief_description_drawings)
 
     g.add_edge(START, "description_generation")
     g.add_edge("description_generation", "component_extraction")
     g.add_edge("component_extraction", "component_graph_json")
     g.add_edge("component_graph_json", "verify_component_graph")
-
-    if diagram_style == "flowchart":
-        g.add_node("drawio_flowchart", node_drawio_flowchart)
-        g.add_edge("verify_component_graph", "drawio_flowchart")
-        g.add_edge("drawio_flowchart", END)
-    else:
-        g.add_node("drawio_block", node_drawio_block)
-        g.add_edge("verify_component_graph", "drawio_block")
-        g.add_edge("drawio_block", END)
+    g.add_edge("verify_component_graph", "drawio_block")
+    g.add_edge("drawio_block", "brief_description_drawings")
+    g.add_edge("brief_description_drawings", END)
 
     return g.compile()
 
@@ -830,33 +886,12 @@ def main() -> None:
         help="LLM backend: openai (OPENAI_API_KEY; optional OPENAI_MODEL) or "
         "claude (ANTHROPIC_API_KEY or CLAUDE_API_KEY; optional CLAUDE_MODEL)",
     )
-    parser.add_argument(
-        "--diagram-style",
-        choices=("block", "flowchart"),
-        default="block",
-        help="Terminal graph node: block=drawio_block (LLM, JSON x/y); "
-        "flowchart=drawio_flowchart (deterministic top-down pipeline).",
-    )
     args = parser.parse_args()
 
     set_llm_provider(args.provider)
 
     data = load_invention(args.json_path)
-    _COMPONENT_ID_MAP.clear()
-    global _NEXT_COMPONENT_ID
-    _NEXT_COMPONENT_ID = 0
-
-    initial: InventionState = {
-        "invention_name": data["invention_name"],
-        "description": data["description"],
-        "key_innovation": data["key_innovation"],
-        "generated_description": "",
-        "component_graph": {},
-        "drawio_xml": "",
-    }
-
-    graph = build_graph(diagram_style=args.diagram_style)
-    final = graph.invoke(initial)
+    final = invoke_patent_drawing_pipeline(data)
 
     print("\n--- Generated description ---\n")
     print(final["generated_description"])
@@ -866,6 +901,8 @@ def main() -> None:
     print(f"\nTotal distinct components: {len(_COMPONENT_ID_MAP)}")
     print("\n--- Component graph (JSON, verified) ---\n")
     print(json.dumps(final["component_graph"], indent=2))
+    print("\n--- Brief Description of the Drawings ---\n")
+    print(final["brief_description_drawings"])
     print("\n--- draw.io (diagrams.net) ---\n")
     url = diagrams_net_create_url(final["drawio_xml"])
     print(url)
