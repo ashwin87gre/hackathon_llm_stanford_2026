@@ -14,6 +14,7 @@ import os
 import sys
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from prompts import SECTION_ORDER
@@ -22,6 +23,18 @@ from generate_draft import _rough_generate_and_merge_section
 TEST_MODE = os.getenv("TEST_MODE", "").lower() in ("1", "true")
 
 app = FastAPI(title="Patent Draft Section Generator")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 VALID_SECTIONS = set(SECTION_ORDER)
 
