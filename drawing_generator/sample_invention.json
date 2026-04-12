@@ -1,0 +1,5 @@
+{
+  "invention_name": "Edge AI Thermostat",
+  "description": "A wall-mounted device that learns occupancy patterns and adjusts HVAC.",
+  "key_innovation": "On-device neural network for inference; uses a low-power CPU with an integrated GPU for model runs; wireless connectivity via Wi-Fi and Bluetooth; temperature sensing with MEMS sensors.The central processing unit is important"
+}

@@ -1,0 +1,5 @@
+{
+  "invention_name": "JuryLens Predictive Venire Simulator",
+  "description": "A software system that simulates jury selection for civil trials by modeling how individual jurors respond to case facts and how those responses relate to plaintiff- versus defense-leaning verdict tendencies.",
+  "key_innovation": "Jurors complete structured attitude and demographic questionnaires, then read a standardized case vignette and record a verdict inclination. A supervised machine learning model is trained on these multimodal inputs to predict whether a given juror profile would lean toward the plaintiff or the defense. Unlike generic survey or sentiment tools, the pipeline couples vignette-grounded verdict behavior with attitudinal and demographic features in one predictive stack; to the inventors' knowledge, no commercially deployed system offers this combined jury-specific predictive workflow for voir dire or trial strategy."
+}
