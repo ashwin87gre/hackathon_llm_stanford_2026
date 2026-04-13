@@ -9,9 +9,11 @@ venv/
 env/
 
 # Environment / secrets
-#.env
+.env
+draft_gen/.env
 .env.*
 !.env.example
+!draft_gen/.env.example
 
 # OS / editor
 .DS_Store

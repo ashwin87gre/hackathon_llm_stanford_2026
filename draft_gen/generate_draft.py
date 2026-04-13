@@ -12,8 +12,13 @@ from prompts import (
 )
 
 
+def _api_key(name: str) -> str:
+    """Strip whitespace/newlines from .env values (common source of 401s)."""
+    return os.environ[name].strip()
+
+
 def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = anthropic.Anthropic(api_key=_api_key("ANTHROPIC_API_KEY"))
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
@@ -24,7 +29,7 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 4096) -
 
 
 def call_gpt(system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
-    client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = openai.OpenAI(api_key=_api_key("OPENAI_API_KEY"))
     response = client.chat.completions.create(
         model="gpt-4o",
         max_tokens=max_tokens,

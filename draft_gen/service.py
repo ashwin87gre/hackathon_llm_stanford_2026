@@ -12,6 +12,12 @@ Launch flags:
 
 import os
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load `draft_gen/.env` regardless of current working directory.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,15 +29,12 @@ from generate_draft import _rough_generate_and_merge_section
 TEST_MODE = os.getenv("TEST_MODE", "").lower() in ("1", "true")
 
 app = FastAPI(title="Patent Draft Section Generator")
+# Local dev: allow any origin so Vite (any host/port) always gets CORS headers.
+# For a public deploy, replace with an explicit allow_origins list.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,6 +55,17 @@ class GenerateSectionResponse(BaseModel):
 
 @app.post("/generate-section", response_model=GenerateSectionResponse)
 def generate_section(req: GenerateSectionRequest):
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        if not os.getenv(key, "").strip():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Missing {key}. Copy draft_gen/.env.example to draft_gen/.env "
+                    "and set your keys, or set the variable in your shell (PowerShell: "
+                    f'$env:{key} = "…").'
+                ),
+            )
+
     if req.section not in VALID_SECTIONS:
         raise HTTPException(
             status_code=400,
