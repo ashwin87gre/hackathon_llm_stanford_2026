@@ -14,7 +14,7 @@ export async function saveDraftToSupabase(
 ): Promise<SaveDraftResult> {
   const supabase = getSupabase()
   if (!supabase) {
-    return { ok: false, error: 'Supabase URL/key missing in .env' }
+    return { ok: false, error: 'Cloud save is not configured.' }
   }
 
   const {

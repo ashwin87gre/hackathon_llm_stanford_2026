@@ -9,10 +9,7 @@ export function isSupabaseConfigured(): boolean {
   )
 }
 
-/**
- * Browser client (anon key). Use only with RLS policies you trust.
- * Never put the service_role key in the frontend.
- */
+/** Browser Supabase client; use only with RLS policies you trust. */
 export function getSupabase(): SupabaseClient | null {
   if (!isSupabaseConfigured()) return null
   if (!client) {

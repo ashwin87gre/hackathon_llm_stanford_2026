@@ -6,6 +6,7 @@ import {
   generateClaims,
   generateTechnicalDescription,
   generateTitle,
+  isDraftBackendConfigured,
   requestDrawingsFromDraft,
   searchPriorArt,
   submitPremiumLawyerReview,
@@ -218,8 +219,8 @@ function App() {
           From idea to filing-ready draft
         </h1>
         <p className="mx-auto mt-3 max-w-lg text-pretty text-sm text-slate-400">
-          Walk through each section, edit freely, then connect your Python services when
-          ready.
+          Walk through each section and edit freely. Run the draft service locally for
+          full generation, or use offline preview text without it.
         </p>
       </header>
 
@@ -240,10 +241,9 @@ function App() {
         {loading && (
           <div className="mb-6 flex items-center gap-3 text-sm text-slate-400">
             <span className="inline-flex h-4 w-4 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
-            Working with placeholder services — swap in your API calls in{' '}
-            <code className="rounded bg-white/10 px-1.5 py-0.5 text-xs text-accent">
-              src/services/api.ts
-            </code>
+            {isDraftBackendConfigured()
+              ? 'Generating sections…'
+              : 'Using offline preview text (set VITE_API_BASE_URL for live generation).'}
           </div>
         )}
 
@@ -266,7 +266,6 @@ function App() {
                 rows={8}
               />
             </label>
-            {/* TODO: on Continue, replace stub with POST to Python — see createInventionDescription in api.ts */}
           </section>
         )}
 
@@ -276,8 +275,8 @@ function App() {
               Title & abstract
             </h2>
             <p className="text-sm text-slate-400">
-              Generated for you (stub), fully editable. Backend:{' '}
-              <code className="text-xs text-accent">draft_gen</code> abstract pass.
+              Generated for you and fully editable. The summary of invention is shown
+              here as the abstract.
             </p>
             <label className="block">
               <span className={labelClass}>Title</span>
@@ -318,7 +317,6 @@ function App() {
                 rows={14}
               />
             </label>
-            {/* TODO: wire generateTechnicalDescription to your merged section output */}
           </section>
         )}
 
@@ -363,8 +361,7 @@ function App() {
                   ))}
                 </ul>
                 <p className="mt-3 text-xs text-slate-500">
-                  {/* TODO: searchPriorArt → Python search_prior_art / patent_search */}
-                  Replace stub results with your retrieval pipeline.
+                  Prior art search is not wired to the backend yet.
                 </p>
               </div>
             </div>
@@ -395,7 +392,6 @@ function App() {
                 />
               </label>
             </div>
-            {/* TODO: requestDrawingsFromDraft — Python drawing_generator */}
             <ul className="mt-8 grid gap-6 sm:grid-cols-2">
               {draft.images.map((img) => (
                 <li
@@ -486,7 +482,6 @@ function App() {
                   Submit for review (stub)
                 </button>
               )}
-              {/* TODO: submitPremiumLawyerReview + getSupabase() for persistence */}
             </div>
           </section>
         )}
@@ -496,12 +491,9 @@ function App() {
         <div className="flex flex-col gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-xs text-slate-500">
             {isSupabaseConfigured() ? (
-              <span className="text-emerald-400/90">Supabase env loaded</span>
+              <span className="text-emerald-400/90">Cloud save ready</span>
             ) : (
-              <>
-                Supabase: copy <code className="text-slate-400">frontend/.env.example</code> to{' '}
-                <code className="text-slate-400">frontend/.env</code> and set URL + anon key.
-              </>
+              <span>Cloud save is off until Supabase is configured in your local environment.</span>
             )}
           </p>
           {isSupabaseConfigured() && (
