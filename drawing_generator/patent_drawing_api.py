@@ -12,9 +12,18 @@ Equivalent::
 
 Then in another terminal::
 
-  curl -s -X POST "http://127.0.0.1:8000/generate" \\
+  echo ""
+  echo "========== Step 1 — GET /health =========="
+  curl -sS "http://127.0.0.1:8000/health"
+  echo ""
+  echo "--- End step 1 output ---"
+  echo ""
+  echo "========== Step 2 — POST /generate =========="
+  curl -sS -X POST "http://127.0.0.1:8000/generate" \\
     -H "Content-Type: application/json" \\
     -d '{"description": "A system that processes images using a neural network."}'
+  echo ""
+  echo "--- End step 2 output ---"
 
 Swagger UI: http://127.0.0.1:8000/docs
 """

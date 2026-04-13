@@ -4,6 +4,16 @@ POST /generate-section
   Body: { "description": str, "section": str, "prior_sections": {str: str} }
   Returns: { "section": str, "content": str }
 
+Example (another terminal; server on port 8000)::
+
+  echo ""
+  echo "========== Step 1 — POST /generate-section =========="
+  curl -sS -X POST "http://127.0.0.1:8000/generate-section" \\
+    -H "Content-Type: application/json" \\
+    -d '{"description": "A wearable that monitors heart rate.", "section": "title", "prior_sections": {}}'
+  echo ""
+  echo "--- End step 1 output ---"
+
 Launch flags:
   python3 service.py           # normal mode
   python3 service.py --test    # test mode: truncated context, 200-token outputs

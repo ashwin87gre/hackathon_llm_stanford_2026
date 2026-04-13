@@ -1,0 +1,4 @@
+cohere
+requests
+fastapi
+uvicorn
